@@ -1,5 +1,5 @@
-import type { ProbeResult } from "../types.ts";
 import { findCatalogEntry } from "../catalog/index.ts";
+import type { ProbeResult } from "../types.ts";
 
 type ProbeParams = {
   provider: string;

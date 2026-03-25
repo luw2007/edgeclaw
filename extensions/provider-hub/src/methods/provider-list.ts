@@ -1,6 +1,6 @@
 import type { OpenClawConfig } from "../../../../src/config/types.openclaw.ts";
-import type { ProviderListEntry } from "../types.ts";
 import { CATALOG, findCatalogEntry } from "../catalog/index.ts";
+import type { ProviderListEntry } from "../types.ts";
 
 /**
  * Build the full provider list by merging the catalog with live config state.

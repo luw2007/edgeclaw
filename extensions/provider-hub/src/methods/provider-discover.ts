@@ -1,5 +1,5 @@
-import type { DiscoverResult } from "../types.ts";
 import { findCatalogEntry } from "../catalog/index.ts";
+import type { DiscoverResult } from "../types.ts";
 
 type DiscoverParams = {
   provider: string;
