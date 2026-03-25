@@ -16,8 +16,8 @@ export type EdgeProviderType = "openai-compatible" | "ollama-native" | "custom";
 
 export type PrivacyConfig = {
   enabled?: boolean;
-  /** S2 handling: "proxy" strips PII via local HTTP proxy (default), "local" routes to local model */
-  s2Policy?: "proxy" | "local";
+  /** S2 handling: "proxy" strips PII via local HTTP proxy (default), "local" routes to local model, "wrap" replaces PII with fake data */
+  s2Policy?: "proxy" | "local" | "wrap";
   /** Port for the privacy proxy server (default: 8403) */
   proxyPort?: number;
   checkpoints?: {
@@ -106,6 +106,8 @@ export type PrivacyConfig = {
    * All default to false (off) to avoid over-redaction.
    */
   redaction?: RedactionOptions;
+  /** Wrap proxy configuration (s2Policy="wrap") */
+  wrapConfig?: WrapConfig;
 };
 
 export type RedactionOptions = {
@@ -267,3 +269,35 @@ export function maxLevel(...levels: SensitivityLevel[]): SensitivityLevel {
   const max = Math.max(...numeric) as SensitivityLevelNumeric;
   return numericToLevel(max);
 }
+
+// ── Wrap Proxy Types ────────────────────────────────────────────────────
+
+export type WrapConfig = {
+  wrapModel?: {
+    type?: EdgeProviderType;
+    provider?: string;
+    model?: string;
+    endpoint?: string;
+    apiKey?: string;
+    module?: string;
+  };
+  fakeDataLocale?: string;
+  restoreMode?: "mapping-only" | "mapping-with-llm";
+  mappingTtlMs?: number;
+  sensitivityThreshold?: number;
+  enableSensitivityCheck?: boolean;
+  sensitivityBlockOnFail?: boolean;
+  timeoutMs?: number;
+};
+
+export type PiiMapping = {
+  original: string;
+  fake: string;
+  type: string;
+};
+
+export type WrapMappingEntry = {
+  mappings: Map<string, PiiMapping>;
+  createdAt: number;
+  lastAccessedAt: number;
+};

@@ -1,10 +1,23 @@
+/**
+ * Built-in Privacy Router
+ *
+ * Wraps the existing detector.ts (ruleDetector + localModelDetector) as a
+ * GuardClawRouter. This is the default "privacy" router that provides
+ * S1/S2/S3 sensitivity detection.
+ *
+ * The detection pipeline inside this router still supports EdgeClaw's
+ * checkpoint → [ruleDetector, localModelDetector] → maxLevel composition.
+ * The privacy router is itself one router in the broader pipeline, and can
+ * coexist with user-defined routers (cost, content-filter, etc.).
+ */
+
 import { defaultPrivacyConfig } from "../config-schema.js";
 import { detectSensitivityLevel } from "../detector.js";
 import { getGuardAgentConfig } from "../guard-agent.js";
 import { desensitizeWithLocalModel } from "../local-model.js";
 import type {
   DetectionContext,
-  ClawXrouterRouter,
+  GuardClawRouter,
   PrivacyConfig,
   RouterDecision,
   SensitivityLevel,
@@ -53,7 +66,15 @@ function detectionToDecision(
     };
   }
 
-  // s2Policy === "proxy"
+  if (s2Policy === "wrap") {
+    return {
+      level: "S2",
+      action: "redirect",
+      target: { provider: "clawxrouter-wrap", model: "" },
+      reason,
+    };
+  }
+
   return {
     level: "S2",
     action: "redirect",
@@ -82,7 +103,7 @@ function getPrivacyConfig(pluginConfig: Record<string, unknown>): PrivacyConfig 
   };
 }
 
-export const privacyRouter: ClawXrouterRouter = {
+export const privacyRouter: GuardClawRouter = {
   id: "privacy",
 
   async detect(

@@ -1,3 +1,12 @@
+/**
+ * GuardClaw Local Model Detector
+ *
+ * Provider-agnostic edge model integration supporting multiple API protocols:
+ *   - "openai-compatible": /v1/chat/completions (Ollama, vLLM, LiteLLM, LocalAI, LMStudio, SGLang, TGI …)
+ *   - "ollama-native":     /api/chat (Ollama native API)
+ *   - "custom":            User-supplied module with callChat() export
+ */
+
 import { loadPrompt, loadPromptWithVars } from "./prompt-loader.js";
 import { getGlobalCollector } from "./token-stats.js";
 import type {
@@ -8,6 +17,7 @@ import type {
   SensitivityLevel,
 } from "./types.js";
 import { levelToNumeric } from "./types.js";
+import { recordRouterOperation } from "./usage-intel.js";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -17,6 +27,9 @@ export type ChatCompletionOptions = {
   stop?: string[];
   frequencyPenalty?: number;
   apiKey?: string;
+  /** Force-disable reasoning output for compatible backends. */
+  disableThinking?: boolean;
+  timeoutMs?: number;
 };
 
 export type LlmUsageInfo = {
@@ -97,7 +110,7 @@ export async function callChatCompletion(
  * OpenAI-compatible chat completions call.
  * POST ${endpoint}/v1/chat/completions — works with Ollama, vLLM, LiteLLM, LocalAI, LMStudio, SGLang, TGI, etc.
  */
-const CLAWXROUTER_FETCH_TIMEOUT_MS = 60_000;
+const GUARDCLAW_FETCH_TIMEOUT_MS = 60_000;
 
 async function callOpenAICompatible(
   endpoint: string,
@@ -105,119 +118,103 @@ async function callOpenAICompatible(
   messages: ChatMessage[],
   options?: ChatCompletionOptions,
 ): Promise<ChatCompletionResult> {
-  const base = endpoint.replace(/\/v1\/?$/, "");
-  const url = `${base}/v1/chat/completions`;
+  const url = endpoint.includes("/chat/completions") ? endpoint : `${endpoint}/v1/chat/completions`;
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (options?.apiKey) {
     headers["Authorization"] = `Bearer ${options.apiKey}`;
   }
 
-  const doFetch = async (): Promise<ChatCompletionResult> => {
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: options?.temperature ?? 0.1,
-        max_tokens: options?.maxTokens ?? 800,
-        stream: true,
-        ...(options?.stop ? { stop: options.stop } : {}),
-        ...(options?.frequencyPenalty != null
-          ? { frequency_penalty: options.frequencyPenalty }
-          : {}),
-      }),
-      signal: AbortSignal.timeout(CLAWXROUTER_FETCH_TIMEOUT_MS),
-    });
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: options?.temperature ?? 0.1,
+      max_tokens: options?.maxTokens ?? 800,
+      stream: true,
+      ...(options?.stop ? { stop: options.stop } : {}),
+      ...(options?.frequencyPenalty != null ? { frequency_penalty: options.frequencyPenalty } : {}),
+      ...(options?.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+    }),
+    signal: AbortSignal.timeout(options?.timeoutMs ?? GUARDCLAW_FETCH_TIMEOUT_MS),
+  });
 
-    if (!response.ok) {
-      let body = "";
-      try {
-        body = (await response.text()).slice(0, 300);
-      } catch {
-        /* ignore */
-      }
-      throw new Error(
-        `Chat completions API error: ${response.status} ${response.statusText}${body ? ` – ${body}` : ""} (url=${url})`,
-      );
-    }
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (contentType.includes("text/event-stream")) {
-      // Use response.text() instead of ReadableStream.getReader() —
-      // Worker threads (synckit) have unreliable ReadableStream consumption
-      // that sometimes yields empty content. Buffering the full body avoids this.
-      const raw = await response.text();
-      return parseSSEText(raw);
-    }
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-    };
-    let text = data.choices?.[0]?.message?.content ?? "";
-    text = stripThinkingTags(text);
-    const usage: LlmUsageInfo | undefined = data.usage
-      ? {
-          input: data.usage.prompt_tokens ?? 0,
-          output: data.usage.completion_tokens ?? 0,
-          total:
-            data.usage.total_tokens ??
-            (data.usage.prompt_tokens ?? 0) + (data.usage.completion_tokens ?? 0),
-        }
-      : undefined;
-    return { text, usage };
-  };
-
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY_MS = 500;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const result = await doFetch();
-    if (result.text.length > 0) return result;
-    if (attempt < MAX_RETRIES) {
-      console.warn(
-        `[ClawXrouter] Empty response from model (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAY_MS}ms…`,
-      );
-      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    }
+  if (!response.ok) {
+    throw new Error(`Chat completions API error: ${response.status} ${response.statusText}`);
   }
-  return { text: "", usage: undefined };
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream") && response.body) {
+    return await consumeSSEStream(response.body);
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  };
+  let text = data.choices?.[0]?.message?.content ?? "";
+  text = stripThinkingTags(text);
+
+  const usage: LlmUsageInfo | undefined = data.usage
+    ? {
+        input: data.usage.prompt_tokens ?? 0,
+        output: data.usage.completion_tokens ?? 0,
+        total:
+          data.usage.total_tokens ??
+          (data.usage.prompt_tokens ?? 0) + (data.usage.completion_tokens ?? 0),
+      }
+    : undefined;
+
+  return { text, usage };
 }
 
-/**
- * Parse SSE text that was fully buffered via response.text().
- * Avoids ReadableStream.getReader() which is unreliable in Worker threads.
- */
-function parseSSEText(raw: string): ChatCompletionResult {
-  const textParts: string[] = [];
+async function consumeSSEStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletionResult> {
+  const decoder = new TextDecoder();
+  const reader = body.getReader();
+  let textParts: string[] = [];
   let usage: LlmUsageInfo | undefined;
+  let buffer = "";
 
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
-    const payload = trimmed.slice(5).trim();
-    if (payload === "[DONE]") continue;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    try {
-      const chunk = JSON.parse(payload) as {
-        choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
-        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-      };
-      const delta = chunk.choices?.[0]?.delta;
-      if (delta?.content) {
-        textParts.push(delta.content);
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+
+        try {
+          const chunk = JSON.parse(payload) as {
+            choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+            usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+          };
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) {
+            textParts.push(delta.content);
+          }
+          if (chunk.usage) {
+            usage = {
+              input: chunk.usage.prompt_tokens ?? 0,
+              output: chunk.usage.completion_tokens ?? 0,
+              total: chunk.usage.total_tokens ?? 0,
+            };
+          }
+        } catch {
+          // skip malformed SSE chunks
+        }
       }
-      if (chunk.usage) {
-        usage = {
-          input: chunk.usage.prompt_tokens ?? 0,
-          output: chunk.usage.completion_tokens ?? 0,
-          total: chunk.usage.total_tokens ?? 0,
-        };
-      }
-    } catch {
-      // skip malformed SSE chunks
     }
+  } finally {
+    reader.releaseLock();
   }
 
   let text = textParts.join("");
@@ -319,6 +316,13 @@ export async function detectByLocalModel(
         source: "router",
         usage: result.usage,
       });
+      recordRouterOperation(
+        context.sessionKey,
+        "detection",
+        result.usage,
+        config.localModel?.model ?? "unknown",
+        config.localModel?.provider,
+      );
     }
 
     return {
@@ -330,7 +334,7 @@ export async function detectByLocalModel(
     };
   } catch (err) {
     // If local model fails, return S1 (safe) but log the error
-    console.error("[ClawXrouter] Local model detection failed:", err);
+    console.error("[GuardClaw] Local model detection failed:", err);
     return {
       level: "S1",
       levelNumeric: 1,
@@ -449,6 +453,7 @@ async function callLocalModel(
       temperature: 0.1,
       maxTokens: 800,
       apiKey: config.localModel?.apiKey,
+      disableThinking: true,
       providerType,
       customModule: config.localModel?.module,
     },
@@ -482,6 +487,7 @@ export async function desensitizeWithLocalModel(
       providerType,
       customModule,
       sessionKey,
+      provider: config.localModel?.provider,
     });
 
     if (piiItems.length === 0) {
@@ -501,7 +507,7 @@ export async function desensitizeWithLocalModel(
 
     return { desensitized: redacted, wasModelUsed: true };
   } catch (err) {
-    console.error("[ClawXrouter] Local model desensitization failed:", err);
+    console.error("[GuardClaw] Local model desensitization failed:", err);
     return { desensitized: content, wasModelUsed: false, failed: true };
   }
 }
@@ -512,6 +518,9 @@ function mapPiiTypeToTag(type: string): string {
   const mapping: Record<string, string> = {
     ADDRESS: "[REDACTED:ADDRESS]",
     ACCESS_CODE: "[REDACTED:ACCESS_CODE]",
+    GATE_CODE: "[REDACTED:ACCESS_CODE]",
+    DOOR_CODE: "[REDACTED:ACCESS_CODE]",
+    PIN: "[REDACTED:ACCESS_CODE]",
     DELIVERY: "[REDACTED:DELIVERY]",
     COURIER_NUMBER: "[REDACTED:DELIVERY]",
     COURIER_NO: "[REDACTED:DELIVERY]",
@@ -529,20 +538,213 @@ function mapPiiTypeToTag(type: string): string {
     ID: "[REDACTED:ID]",
     ID_CARD: "[REDACTED:ID]",
     ID_NUMBER: "[REDACTED:ID]",
+    PASSPORT: "[REDACTED:ID]",
+    PASSPORT_NUMBER: "[REDACTED:ID]",
+    DRIVER_LICENSE: "[REDACTED:ID]",
+    DRIVERS_LICENSE: "[REDACTED:ID]",
+    DL: "[REDACTED:ID]",
+    SSN: "[REDACTED:ID]",
     CARD: "[REDACTED:CARD]",
     BANK_CARD: "[REDACTED:CARD]",
     CARD_NUMBER: "[REDACTED:CARD]",
     SECRET: "[REDACTED:SECRET]",
     PASSWORD: "[REDACTED:SECRET]",
-    API_KEY: "[REDACTED:SECRET]",
+    API_KEY: "[REDACTED:API_KEY]",
     TOKEN: "[REDACTED:SECRET]",
+    CREDENTIAL: "[REDACTED:SECRET]",
+    ACCESS_KEY: "[REDACTED:ACCESS_KEY]",
+    AK: "[REDACTED:ACCESS_KEY]",
+    AWS_KEY: "[REDACTED:ACCESS_KEY]",
+    AWS_ACCESS_KEY: "[REDACTED:ACCESS_KEY]",
+    SECRET_KEY: "[REDACTED:SECRET_KEY]",
+    SK: "[REDACTED:SECRET_KEY]",
+    AWS_SECRET: "[REDACTED:SECRET_KEY]",
+    AWS_SECRET_KEY: "[REDACTED:SECRET_KEY]",
+    JWT: "[REDACTED:JWT]",
+    JWT_TOKEN: "[REDACTED:JWT]",
+    BEARER_TOKEN: "[REDACTED:JWT]",
+    RSA_PRIVATE_KEY: "[REDACTED:PRIVATE_KEY]",
+    PRIVATE_KEY: "[REDACTED:PRIVATE_KEY]",
+    RSA_KEY: "[REDACTED:PRIVATE_KEY]",
+    RSA_PUBLIC_KEY: "[REDACTED:PUBLIC_KEY]",
+    PUBLIC_KEY: "[REDACTED:PUBLIC_KEY]",
+    CERTIFICATE: "[REDACTED:CERTIFICATE]",
+    CERT: "[REDACTED:CERTIFICATE]",
+    X509: "[REDACTED:CERTIFICATE]",
+    X509_CERT: "[REDACTED:CERTIFICATE]",
+    HTTPS_CERT: "[REDACTED:CERTIFICATE]",
+    SSL_CERT: "[REDACTED:CERTIFICATE]",
+    TLS_CERT: "[REDACTED:CERTIFICATE]",
+    SSH_KEY: "[REDACTED:SSH_KEY]",
+    SSH_PUBLIC_KEY: "[REDACTED:SSH_KEY]",
+    DB_CONNECTION: "[REDACTED:DB_CONNECTION]",
+    CONNECTION_STRING: "[REDACTED:DB_CONNECTION]",
+    DATABASE_URL: "[REDACTED:DB_CONNECTION]",
+    ENV_VAR: "[REDACTED:ENV_VAR]",
+    ENV_VARIABLE: "[REDACTED:ENV_VAR]",
     IP: "[REDACTED:IP]",
     LICENSE_PLATE: "[REDACTED:LICENSE]",
     PLATE: "[REDACTED:LICENSE]",
+    COMPANY: "[REDACTED:COMPANY]",
+    COMPANY_NAME: "[REDACTED:COMPANY]",
+    ORGANIZATION: "[REDACTED:COMPANY]",
+    ORG: "[REDACTED:COMPANY]",
+    USCC: "[REDACTED:USCC]",
+    UNIFIED_SOCIAL_CREDIT_CODE: "[REDACTED:USCC]",
+    TAX_ID: "[REDACTED:TAX_ID]",
+    TAX_NUMBER: "[REDACTED:TAX_ID]",
+    BANK_ACCOUNT: "[REDACTED:BANK_ACCOUNT]",
+    ACCOUNT_NUMBER: "[REDACTED:BANK_ACCOUNT]",
+    BIZ_LICENSE: "[REDACTED:BIZ_LICENSE]",
+    BUSINESS_LICENSE: "[REDACTED:BIZ_LICENSE]",
+    ORG_CODE: "[REDACTED:ORG_CODE]",
+    ORGANIZATION_CODE: "[REDACTED:ORG_CODE]",
+    DOMAIN: "[REDACTED:DOMAIN]",
+    WEBSITE: "[REDACTED:DOMAIN]",
+    URL: "[REDACTED:URL]",
+    JOB_TITLE: "[REDACTED:JOB_TITLE]",
+    POSITION: "[REDACTED:JOB_TITLE]",
+    TITLE: "[REDACTED:JOB_TITLE]",
+    DEPARTMENT: "[REDACTED:DEPARTMENT]",
+    DEPT: "[REDACTED:DEPARTMENT]",
+    PAYMENT: "[REDACTED:PAYMENT]",
+    PAYMENT_ACCOUNT: "[REDACTED:PAYMENT]",
+    BIRTHDAY: "[REDACTED:BIRTHDAY]",
+    DOB: "[REDACTED:BIRTHDAY]",
+    DATE_OF_BIRTH: "[REDACTED:BIRTHDAY]",
     TIME: "[REDACTED:TIME]",
     DATE: "[REDACTED:DATE]",
     SALARY: "[REDACTED:SALARY]",
+    INCOME: "[REDACTED:SALARY]",
+    WAGE: "[REDACTED:SALARY]",
     AMOUNT: "[REDACTED:AMOUNT]",
+    PRICE: "[REDACTED:AMOUNT]",
+    COST: "[REDACTED:AMOUNT]",
+    NOTE: "[REDACTED:NOTE]",
+    REMARK: "[REDACTED:NOTE]",
+    MEMO: "[REDACTED:NOTE]",
+    ORDER: "[REDACTED:ORDER]",
+    ORDER_NUMBER: "[REDACTED:ORDER]",
+    ORDER_ID: "[REDACTED:ORDER]",
+    CONTRACT: "[REDACTED:CONTRACT]",
+    CONTRACT_NUMBER: "[REDACTED:CONTRACT]",
+    CONTRACT_ID: "[REDACTED:CONTRACT]",
+    INVOICE: "[REDACTED:INVOICE]",
+    INVOICE_NUMBER: "[REDACTED:INVOICE]",
+    INVOICE_ID: "[REDACTED:INVOICE]",
+    CUSTOMER_ID: "[REDACTED:CUSTOMER_ID]",
+    CUSTOMER_NUMBER: "[REDACTED:CUSTOMER_ID]",
+    CLIENT_ID: "[REDACTED:CUSTOMER_ID]",
+    TRANSACTION: "[REDACTED:TRANSACTION]",
+    TRANSACTION_ID: "[REDACTED:TRANSACTION]",
+    TXN_ID: "[REDACTED:TRANSACTION]",
+    RECEIPT: "[REDACTED:RECEIPT]",
+    RECEIPT_NUMBER: "[REDACTED:RECEIPT]",
+    RECEIPT_ID: "[REDACTED:RECEIPT]",
+    SKU: "[REDACTED:SKU]",
+    ITEM_CODE: "[REDACTED:SKU]",
+    PRODUCT_CODE: "[REDACTED:SKU]",
+    PRODUCT: "[REDACTED:PRODUCT]",
+    PRODUCT_NAME: "[REDACTED:PRODUCT]",
+    ITEM_NAME: "[REDACTED:PRODUCT]",
+    PROJECT: "[REDACTED:PROJECT]",
+    PROJECT_CODE: "[REDACTED:PROJECT]",
+    PROJECT_ID: "[REDACTED:PROJECT]",
+    EMPLOYEE_ID: "[REDACTED:EMPLOYEE_ID]",
+    STAFF_ID: "[REDACTED:EMPLOYEE_ID]",
+    WORKER_ID: "[REDACTED:EMPLOYEE_ID]",
+    ETHNICITY: "[REDACTED:ETHNICITY]",
+    RACE: "[REDACTED:ETHNICITY]",
+    ETHNIC_ORIGIN: "[REDACTED:ETHNICITY]",
+    RELIGION: "[REDACTED:RELIGION]",
+    RELIGIOUS_BELIEF: "[REDACTED:RELIGION]",
+    PHILOSOPHICAL_BELIEF: "[REDACTED:RELIGION]",
+    POLITICAL_OPINION: "[REDACTED:POLITICAL]",
+    POLITICAL_AFFILIATION: "[REDACTED:POLITICAL]",
+    POLITICAL_PARTY: "[REDACTED:POLITICAL]",
+    UNION_MEMBERSHIP: "[REDACTED:UNION]",
+    TRADE_UNION: "[REDACTED:UNION]",
+    HEALTH: "[REDACTED:HEALTH]",
+    HEALTH_CONDITION: "[REDACTED:HEALTH]",
+    MEDICAL_CONDITION: "[REDACTED:HEALTH]",
+    DIAGNOSIS: "[REDACTED:HEALTH]",
+    MEDICATION: "[REDACTED:MEDICATION]",
+    PRESCRIPTION: "[REDACTED:MEDICATION]",
+    DRUG: "[REDACTED:MEDICATION]",
+    BIOMETRIC: "[REDACTED:BIOMETRIC]",
+    BIOMETRIC_ID: "[REDACTED:BIOMETRIC]",
+    FINGERPRINT: "[REDACTED:BIOMETRIC]",
+    FACE_ID: "[REDACTED:BIOMETRIC]",
+    VOICEPRINT: "[REDACTED:BIOMETRIC]",
+    GENETIC: "[REDACTED:GENETIC]",
+    GENETIC_DATA: "[REDACTED:GENETIC]",
+    GENETIC_MARKER: "[REDACTED:GENETIC]",
+    DNA: "[REDACTED:GENETIC]",
+    SEXUAL_ORIENTATION: "[REDACTED:SEXUAL_ORIENTATION]",
+    SEXUALITY: "[REDACTED:SEXUAL_ORIENTATION]",
+    CRIMINAL_RECORD: "[REDACTED:CRIMINAL_RECORD]",
+    CONVICTION: "[REDACTED:CRIMINAL_RECORD]",
+    OFFENSE: "[REDACTED:CRIMINAL_RECORD]",
+    GENDER: "[REDACTED:GENDER]",
+    SEX: "[REDACTED:GENDER]",
+    AGE: "[REDACTED:AGE]",
+    BIRTH_PLACE: "[REDACTED:BIRTH_PLACE]",
+    PLACE_OF_BIRTH: "[REDACTED:BIRTH_PLACE]",
+    BIRTHPLACE: "[REDACTED:BIRTH_PLACE]",
+    NATIONALITY: "[REDACTED:NATIONALITY]",
+    CITIZENSHIP: "[REDACTED:NATIONALITY]",
+    IMMIGRATION_STATUS: "[REDACTED:NATIONALITY]",
+    MEDICAL_RECORD_NUMBER: "[REDACTED:MRN]",
+    MRN: "[REDACTED:MRN]",
+    PATIENT_ID: "[REDACTED:MRN]",
+    HEALTH_PLAN_ID: "[REDACTED:HEALTH_PLAN]",
+    HEALTH_PLAN_NUMBER: "[REDACTED:HEALTH_PLAN]",
+    MEDICARE_ID: "[REDACTED:HEALTH_PLAN]",
+    MEDICAID_ID: "[REDACTED:HEALTH_PLAN]",
+    INSURANCE_NUMBER: "[REDACTED:INSURANCE]",
+    INSURANCE_ID: "[REDACTED:INSURANCE]",
+    POLICY_NUMBER: "[REDACTED:INSURANCE]",
+    DEVICE_ID: "[REDACTED:DEVICE_ID]",
+    DEVICE_IDENTIFIER: "[REDACTED:DEVICE_ID]",
+    SERIAL_NUMBER: "[REDACTED:DEVICE_ID]",
+    IMEI: "[REDACTED:DEVICE_ID]",
+    MAC_ADDRESS: "[REDACTED:DEVICE_ID]",
+    GEO_COORDINATES: "[REDACTED:GEO]",
+    GPS: "[REDACTED:GEO]",
+    LATITUDE_LONGITUDE: "[REDACTED:GEO]",
+    LOCATION: "[REDACTED:GEO]",
+    GEOLOCATION: "[REDACTED:GEO]",
+    COOKIE_ID: "[REDACTED:COOKIE_ID]",
+    TRACKING_ID: "[REDACTED:COOKIE_ID]",
+    ADVERTISING_ID: "[REDACTED:COOKIE_ID]",
+    DEVICE_FINGERPRINT: "[REDACTED:COOKIE_ID]",
+    STUDENT_ID: "[REDACTED:STUDENT_ID]",
+    STUDENT_NUMBER: "[REDACTED:STUDENT_ID]",
+    CREDIT_SCORE: "[REDACTED:CREDIT_SCORE]",
+    CREDIT_RATING: "[REDACTED:CREDIT_SCORE]",
+    FICO_SCORE: "[REDACTED:CREDIT_SCORE]",
+    LOAN_NUMBER: "[REDACTED:LOAN]",
+    LOAN_ID: "[REDACTED:LOAN]",
+    MORTGAGE_NUMBER: "[REDACTED:LOAN]",
+    FAX: "[REDACTED:FAX]",
+    FAX_NUMBER: "[REDACTED:FAX]",
+    USERNAME: "[REDACTED:USERNAME]",
+    ACCOUNT_NAME: "[REDACTED:USERNAME]",
+    SCREEN_NAME: "[REDACTED:USERNAME]",
+    HANDLE: "[REDACTED:USERNAME]",
+    SIGNATURE: "[REDACTED:SIGNATURE]",
+    DIGITAL_SIGNATURE: "[REDACTED:SIGNATURE]",
+    BROWSING_HISTORY: "[REDACTED:BROWSING_HISTORY]",
+    SEARCH_HISTORY: "[REDACTED:BROWSING_HISTORY]",
+    SEARCH_QUERY: "[REDACTED:BROWSING_HISTORY]",
+    BROWSING_DATA: "[REDACTED:BROWSING_HISTORY]",
+    WEB_HISTORY: "[REDACTED:BROWSING_HISTORY]",
+    MESSAGE_CONTENT: "[REDACTED:MESSAGE_CONTENT]",
+    COMMUNICATION: "[REDACTED:MESSAGE_CONTENT]",
+    SMS_CONTENT: "[REDACTED:MESSAGE_CONTENT]",
+    EMAIL_CONTENT: "[REDACTED:MESSAGE_CONTENT]",
+    CHAT_MESSAGE: "[REDACTED:MESSAGE_CONTENT]",
+    MAIL_BODY: "[REDACTED:MESSAGE_CONTENT]",
   };
   return mapping[t] ?? `[REDACTED:${t}]`;
 }
@@ -557,13 +759,34 @@ function replaceAll(str: string, search: string, replacement: string): string {
 /** Default PII extraction system prompt (fallback if prompts/pii-extraction.md is missing) */
 export const DEFAULT_PII_EXTRACTION_PROMPT = `You are a PII extraction engine. Extract ALL PII (personally identifiable information) from the given text as a JSON array.
 
-Types: NAME (every person), PHONE, ADDRESS (all variants including shortened), ACCESS_CODE (gate/door/门禁码), DELIVERY (tracking numbers, pickup codes/取件码), ID (SSN/身份证), CARD (bank/medical/insurance), LICENSE_PLATE (plate numbers/车牌), EMAIL, PASSWORD, PAYMENT (Venmo/PayPal/支付宝), BIRTHDAY, TIME (appointment/delivery times), NOTE (private instructions)
+Personal types: NAME (every person), PHONE, LANDLINE, FAX, ADDRESS (all variants including shortened), ACCESS_CODE (gate/door/门禁码), DELIVERY (tracking numbers, pickup codes/取件码), ID (SSN/身份证), PASSPORT, DRIVER_LICENSE, CARD (bank/medical/insurance), LICENSE_PLATE (plate numbers/车牌), EMAIL, PASSWORD, PAYMENT (Venmo/PayPal/支付宝/微信), BIRTHDAY, AGE, GENDER, BIRTH_PLACE, NATIONALITY, SALARY, AMOUNT (monetary values), TIME (appointment/delivery times), DATE, NOTE (private instructions), IP, USERNAME (account names/handles)
 
-Important: Extract EVERY person's name and EVERY address variant.
+GDPR Art.9 special categories: ETHNICITY (race/民族/种族), RELIGION (religious/philosophical beliefs), POLITICAL_OPINION (political affiliations/party), UNION_MEMBERSHIP (trade union), HEALTH (medical conditions/diagnoses), MEDICATION (prescriptions/drugs), BIOMETRIC (fingerprints/face ID/voiceprints), GENETIC (DNA/genetic markers), SEXUAL_ORIENTATION, CRIMINAL_RECORD (convictions/offenses)
 
-Example:
-Input: Alex lives at 123 Main St. Li Na phone 13912345678, gate code 1234#, card YB330-123, plate 京A12345, tracking SF123, Venmo @alex99
-Output: [{"type":"NAME","value":"Alex"},{"type":"NAME","value":"Li Na"},{"type":"ADDRESS","value":"123 Main St"},{"type":"PHONE","value":"13912345678"},{"type":"ACCESS_CODE","value":"1234#"},{"type":"CARD","value":"YB330-123"},{"type":"LICENSE_PLATE","value":"京A12345"},{"type":"DELIVERY","value":"SF123"},{"type":"PAYMENT","value":"@alex99"}]
+HIPAA/healthcare: MEDICAL_RECORD_NUMBER/MRN (patient IDs), HEALTH_PLAN_ID (Medicare/Medicaid/insurance plan numbers), DEVICE_ID (medical device identifiers/IMEI/serial numbers)
+
+CCPA/financial/identity: INSURANCE_NUMBER (policy numbers), CREDIT_SCORE (FICO/credit ratings), LOAN_NUMBER (loans/mortgages), GEO_COORDINATES (GPS/precise location), COOKIE_ID (tracking IDs/advertising IDs/device fingerprints), STUDENT_ID (education records), SIGNATURE, BROWSING_HISTORY (browsing/search history/浏览记录/搜索记录), MESSAGE_CONTENT (email/SMS/chat message content/邮件内容/短信内容/聊天消息)
+
+Secrets & credentials: API_KEY (sk-xxx/key-xxx prefixed keys), ACCESS_KEY/AK (AKIA-prefixed AWS keys), SECRET_KEY/SK (cloud secret keys), JWT (JSON Web Tokens/Bearer tokens), PRIVATE_KEY (RSA/PEM private keys), PUBLIC_KEY, CERTIFICATE/CERT (X.509/SSL/TLS/HTTPS certs), SSH_KEY (ssh-rsa public keys), DB_CONNECTION (database connection strings/DSN), ENV_VAR (KEY=VALUE environment variables)
+
+Enterprise types: COMPANY (company/organization names/公司名), USCC (统一社会信用代码/18-digit), TAX_ID (税号), BANK_ACCOUNT (对公账户), BIZ_LICENSE (营业执照号), ORG_CODE (组织机构代码), DOMAIN (company domains/websites), URL, JOB_TITLE (职位), DEPARTMENT (部门)
+
+Business data types: ORDER (订单号/order numbers), CONTRACT (合同号), INVOICE (发票号), CUSTOMER_ID (客户编号), TRANSACTION (交易流水号), RECEIPT (收据号), SKU (商品编码/item codes), PRODUCT (产品名称), PROJECT (项目编号), EMPLOYEE_ID (员工工号)
+
+Important: Extract EVERY person's name, EVERY address variant, ALL company/organization names, and ALL business identifiers (order/contract/invoice numbers, etc).
+Extract ALL IP addresses (e.g. 192.168.x.x, 10.x.x.x), database hosts, server addresses, ports, usernames, and passwords — especially from technical/code contexts.
+
+Example 1:
+Input: Alex at Apex Inc (USCC 91110108MA01ABCD5X) placed order ORD20240315001 for SKU ABC-1234. Li Na phone 13912345678, gate code 1234#, contract HT-2024-000123, invoice 0412345678, customer CUS00012345, project PRJ-2024-0088
+Output: [{"type":"NAME","value":"Alex"},{"type":"COMPANY","value":"Apex Inc"},{"type":"USCC","value":"91110108MA01ABCD5X"},{"type":"ORDER","value":"ORD20240315001"},{"type":"SKU","value":"ABC-1234"},{"type":"NAME","value":"Li Na"},{"type":"PHONE","value":"13912345678"},{"type":"ACCESS_CODE","value":"1234#"},{"type":"CONTRACT","value":"HT-2024-000123"},{"type":"INVOICE","value":"0412345678"},{"type":"CUSTOMER_ID","value":"CUS00012345"},{"type":"PROJECT","value":"PRJ-2024-0088"}]
+
+Example 2:
+Input: 连接 MySQL 192.168.1.100:3306，用户名 root，密码 P@ss123。邮件发到 test@corp.com，SMTP smtp.corp.com:587
+Output: [{"type":"IP","value":"192.168.1.100"},{"type":"USERNAME","value":"root"},{"type":"PASSWORD","value":"P@ss123"},{"type":"EMAIL","value":"test@corp.com"},{"type":"DOMAIN","value":"smtp.corp.com"}]
+
+Now extract PII from the following text:
+
+{{CONTENT}}
 
 Output ONLY the JSON array — no explanation, no markdown fences.`;
 
@@ -582,6 +805,7 @@ async function extractPiiWithModel(
     providerType?: EdgeProviderType;
     customModule?: string;
     sessionKey?: string;
+    provider?: string;
   },
 ): Promise<Array<{ type: string; value: string }>> {
   const textSnippet = content.slice(0, 3000);
@@ -607,6 +831,7 @@ async function extractPiiWithModel(
       maxTokens: 2500,
       stop: ["Input:", "Task:"],
       apiKey: opts?.apiKey,
+      disableThinking: true,
       providerType: opts?.providerType,
       customModule: opts?.customModule,
     },
@@ -621,6 +846,7 @@ async function extractPiiWithModel(
       source: "router",
       usage: result.usage,
     });
+    recordRouterOperation(opts?.sessionKey, "desensitization", result.usage, model, opts?.provider);
   }
 
   return parsePiiJson(result.text);
@@ -676,7 +902,7 @@ function parsePiiJson(raw: string): Array<{ type: string; value: string }> {
     ) as Array<{ type: string; value: string }>;
     return items;
   } catch {
-    console.error("[ClawXrouter] Failed to parse PII extraction JSON:", jsonStr.slice(0, 300));
+    console.error("[GuardClaw] Failed to parse PII extraction JSON:", jsonStr.slice(0, 300));
     return [];
   }
 }
@@ -690,6 +916,7 @@ function parseModelResponse(response: string): {
   confidence?: number;
 } {
   try {
+    // Try to find JSON in the response
     const jsonMatch = response.match(/\{[\s\S]*?\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]) as {
@@ -733,7 +960,7 @@ function parseModelResponse(response: string): {
       confidence: 0.3,
     };
   } catch (err) {
-    console.error("[ClawXrouter] Error parsing model response:", err);
+    console.error("[GuardClaw] Error parsing model response:", err);
     return {
       level: "S1",
       reason: "Parse error",

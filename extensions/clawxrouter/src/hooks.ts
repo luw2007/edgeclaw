@@ -1,22 +1,41 @@
+/**
+ * GuardClaw Hooks — openclaw adaptation
+ *
+ * Registers all plugin hooks for sensitivity detection at various checkpoints.
+ * Uses the RouterPipeline to dispatch to multiple composable routers
+ * (built-in "privacy" + any user-defined custom routers).
+ *
+ * Architecture:
+ *   before_model_resolve  → pipeline.run("onUserMessage") → RouterDecision
+ *   before_prompt_build   → reads stashed decision → inject prompt/markers
+ *   before_tool_call      → pipeline + memory_get path redirect (dual-track)
+ *   after_tool_call       → pipeline + memory dual-write sync
+ *   tool_result_persist   → PII redaction + memory_search result filtering
+ *   before_message_write  → sanitize transcript based on stashed decision
+ *   after_compaction      → full memory sync (FULL → clean)
+ *   before_reset          → full memory sync before session clear
+ *   + session_end, message_sending, before_agent_start, message_received
+ */
+
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   buildMainSessionPlaceholder,
   getGuardAgentConfig,
   isGuardSessionKey,
+  isLocalProvider,
 } from "./guard-agent.js";
 import { getLiveConfig } from "./live-config.js";
 import { desensitizeWithLocalModel } from "./local-model.js";
+import { finalizeLoop } from "./loop-detection-level.js";
 import {
   getDefaultMemoryManager,
   GUARD_SECTION_BEGIN,
   GUARD_SECTION_END,
 } from "./memory-isolation.js";
-import { CLAWXROUTER_S2_OPEN, CLAWXROUTER_S2_CLOSE } from "./privacy-proxy.js";
+import { GUARDCLAW_S2_OPEN, GUARDCLAW_S2_CLOSE, stashOriginalProvider } from "./privacy-proxy.js";
 import { loadPrompt } from "./prompt-loader.js";
-import { ensureModelMirrored, resolveOriginalProvider } from "./provider.js";
 import { getGlobalPipeline } from "./router-pipeline.js";
 import { detectByRules } from "./rules.js";
 import {
@@ -28,10 +47,6 @@ import {
   markSessionAsPrivate,
   trackSessionLevel,
   recordDetection,
-  notifyDetectionStart,
-  notifyGenerating,
-  notifyLlmComplete,
-  notifyInputEstimate,
   isSessionMarkedPrivate,
   stashDetection,
   getPendingDetection,
@@ -41,18 +56,23 @@ import {
   clearSessionState,
   isActiveLocalRouting,
   resetTurnLevel,
-  setSessionRouteLevel,
-  getSessionRouteLevel,
-  startNewLoop,
-  getCurrentLoopId,
-  stashDesensitizedToolResult,
-  setLoopRouting,
+  stashWrappedPrompt,
+  getWrappedStash,
+  consumeWrappedStash,
+  isWrapMode,
 } from "./session-state.js";
-import { syncDesensitizeWithLocalModel } from "./sync-desensitize.js";
 import { syncDetectByLocalModel } from "./sync-detect.js";
-import { getGlobalCollector, lookupPricing } from "./token-stats.js";
+import { getGlobalCollector } from "./token-stats.js";
 import type { PrivacyConfig } from "./types.js";
-import { isProtectedMemoryPath, redactSensitiveInfo, extractPathsFromParams } from "./utils.js";
+import { recordFinalReply } from "./usage-intel.js";
+import {
+  isProtectedMemoryPath,
+  redactSensitiveInfo,
+  extractPathsFromParams,
+  resolveDefaultBaseUrl,
+} from "./utils.js";
+import { getGlobalWrapMappingManager } from "./wrap-mapping.js";
+import { wrapDesensitize, wrapRestore } from "./wrap-proxy.js";
 
 function getPipelineConfig(): Record<string, unknown> {
   return { privacy: getLiveConfig() };
@@ -106,19 +126,6 @@ function isToolAllowlisted(toolName: string): boolean {
   return allowlist.includes(toolName);
 }
 
-/**
- * Resolve a usable session key from the hook context.
- *
- * OpenClaw passes `ctx.sessionKey` when the session was resolved from a
- * channel sender (--to / Telegram / Discord …).  But when the caller only
- * supplies `--session-id` (e.g. the `openclaw agent` CLI), sessionKey can
- * be `undefined`.  Fall back to `sessionId` so ClawXrouter detection still
- * runs in that scenario.
- */
-function resolveHookSessionKey(ctx: { sessionKey?: string; sessionId?: string }): string {
-  return ctx.sessionKey || ctx.sessionId || "";
-}
-
 // Workspace dir cache — set from first hook that has PluginHookAgentContext
 let _cachedWorkspaceDir: string | undefined;
 
@@ -128,22 +135,23 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
   const memoryManager = getDefaultMemoryManager();
   memoryManager.initializeDirectories().catch((err) => {
-    api.logger.error(`[ClawXrouter] Failed to initialize memory directories: ${String(err)}`);
+    api.logger.error(`[GuardClaw] Failed to initialize memory directories: ${String(err)}`);
   });
 
   getDefaultSessionManager(sessionBaseDir);
 
+  // =========================================================================
+  // Hook 1: before_model_resolve — Run pipeline + model routing
+  // =========================================================================
   api.on("before_model_resolve", async (event, ctx) => {
     try {
       const { prompt } = event;
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey || !prompt) return;
 
       clearActiveLocalRouting(sessionKey);
       resetTurnLevel(sessionKey);
       consumeDetection(sessionKey);
-      const loopId = startNewLoop(sessionKey, String(prompt));
-      notifyDetectionStart(sessionKey, "onUserMessage", loopId);
 
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
@@ -158,9 +166,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
 
-      const rawMsg = String(prompt);
-      if (shouldSkipMessage(rawMsg)) return;
-      const msgStr = stripTimestampPrefix(rawMsg);
+      const msgStr = String(prompt);
+      if (shouldSkipMessage(msgStr)) return;
 
       // ── S3 fast path: rule-based pre-check ──────────────────────────
       // Rules are synchronous and deterministic. When they detect S3 we
@@ -188,106 +195,34 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const provider = guardCfg?.provider ?? defaultProvider;
         const model =
           guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
-        api.logger.info(`[ClawXrouter] S3 (rule fast-path) — routing to ${provider}/${model}`);
+        api.logger.info(`[GuardClaw] S3 (rule fast-path) — routing to ${provider}/${model}`);
         return { providerOverride: provider, modelOverride: model };
       }
 
       // ── Normal path: run the full router pipeline ──────────────────
       const pipeline = getGlobalPipeline();
       if (!pipeline) {
-        api.logger.warn("[ClawXrouter] Router pipeline not initialized");
+        api.logger.warn("[GuardClaw] Router pipeline not initialized");
         return;
       }
-
-      const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
-      const primaryModel =
-        ((defaults?.model as Record<string, unknown> | undefined)?.primary as string) ?? "";
-      const defaultProvider =
-        (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
 
       const decision = await pipeline.run(
         "onUserMessage",
         {
           checkpoint: "onUserMessage",
-          message: msgStr,
+          message: prompt,
           sessionKey,
           agentId: ctx.agentId,
         },
         getPipelineConfig(),
       );
 
-      recordDetection(
-        sessionKey,
-        decision.level,
-        "onUserMessage",
-        decision.reason,
-        decision.routerId,
-        decision.action,
-        decision.target ? `${decision.target.provider}/${decision.target.model}` : undefined,
-      );
-      setSessionRouteLevel(sessionKey, decision.level);
-
-      if (decision.routerId === "token-saver" && decision.reason?.startsWith("tier=")) {
-        const tier = decision.reason.split("=")[1];
-        setLoopRouting(
-          sessionKey,
-          tier,
-          decision.target ? `${decision.target.provider}/${decision.target.model}` : undefined,
-          decision.action ?? "passthrough",
-        );
-      }
+      recordDetection(sessionKey, decision.level, "onUserMessage", decision.reason);
       api.logger.info(
-        `[ClawXrouter] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`,
+        `[GuardClaw] ROUTE: session=${sessionKey} level=${decision.level} action=${decision.action} target=${JSON.stringify(decision.target)} reason=${decision.reason}`,
       );
-
-      if (decision.action !== "block") {
-        notifyGenerating(
-          sessionKey,
-          "onUserMessage",
-          decision.level,
-          decision.routerId,
-          decision.action,
-          decision.target ? `${decision.target.provider}/${decision.target.model}` : undefined,
-          decision.reason,
-        );
-      }
-
-      // S1: ALL S1 traffic routes through proxy for defense-in-depth
-      // (schema cleaning, regex PII scan). Token-saver may redirect to a
-      // different model — we honour the model choice but still proxy.
-      if (decision.level === "S1") {
-        const targetModel = decision.target?.model;
-        const targetOriginalProvider =
-          decision.target?.provider !== "clawxrouter-privacy"
-            ? decision.target?.provider
-            : undefined;
-        const originalProv =
-          targetOriginalProvider ??
-          (targetModel
-            ? resolveOriginalProvider(
-                api.config as Record<string, unknown>,
-                targetModel,
-                defaultProvider,
-              )
-            : defaultProvider);
-        if (targetModel) {
-          ensureModelMirrored(
-            api.config as Record<string, unknown>,
-            targetModel,
-            originalProv,
-            () => {
-              try {
-                return api.runtime.config.loadConfig();
-              } catch {
-                return undefined;
-              }
-            },
-          );
-        }
-        return {
-          providerOverride: "clawxrouter-privacy",
-          ...(targetModel ? { modelOverride: targetModel } : {}),
-        };
+      if (decision.level === "S1" && decision.action === "passthrough") {
+        return;
       }
 
       // S3 from LLM detector (rules didn't catch it above): route to local
@@ -302,7 +237,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         });
         if (decision.target) {
           api.logger.info(
-            `[ClawXrouter] S3 — routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
+            `[GuardClaw] S3 — routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
           );
           return {
             providerOverride: decision.target.provider,
@@ -312,7 +247,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         api.logger.info(
-          `[ClawXrouter] S3 — routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`,
+          `[GuardClaw] S3 — routing to ${guardCfg?.provider ?? defaultProvider}/${guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1"} [${decision.routerId}]`,
         );
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
@@ -329,7 +264,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const result = await desensitizeWithLocalModel(msgStr, privacyConfig, sessionKey);
         if (result.failed) {
           api.logger.warn(
-            "[ClawXrouter] S2 desensitization failed — escalating to S3 (local-only) to prevent PII leak",
+            "[GuardClaw] S2 desensitization failed — escalating to S3 (local-only) to prevent PII leak",
           );
           trackSessionLevel(sessionKey, "S3");
           setActiveLocalRouting(sessionKey);
@@ -363,12 +298,13 @@ export function registerHooks(api: OpenClawPluginApi): void {
       if (
         decision.level === "S2" &&
         decision.action === "redirect" &&
-        decision.target?.provider !== "clawxrouter-privacy"
+        decision.target?.provider !== "clawxrouter-privacy" &&
+        decision.target?.provider !== "clawxrouter-wrap"
       ) {
         markSessionAsPrivate(sessionKey, decision.level);
         if (decision.target) {
           api.logger.info(
-            `[ClawXrouter] S2 — routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
+            `[GuardClaw] S2 — routing to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
           );
           return {
             providerOverride: decision.target.provider,
@@ -377,46 +313,100 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
 
-      // S2-proxy: route through privacy proxy (model-keyed map handles upstream)
+      // S2-proxy path
       if (decision.level === "S2" && decision.target?.provider === "clawxrouter-privacy") {
         markSessionAsPrivate(sessionKey, "S2");
-        const targetModel = decision.target.model;
-        const actualProvider =
-          decision.target.originalProvider ??
-          (targetModel
-            ? resolveOriginalProvider(
-                api.config as Record<string, unknown>,
-                targetModel,
-                defaultProvider,
-              )
-            : defaultProvider);
-        if (targetModel) {
-          ensureModelMirrored(
-            api.config as Record<string, unknown>,
-            targetModel,
-            actualProvider,
-            () => {
-              try {
-                return api.runtime.config.loadConfig();
-              } catch {
-                return undefined;
-              }
-            },
-          );
+        const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
+        const primaryModel =
+          ((defaults?.model as Record<string, unknown> | undefined)?.primary as string) ?? "";
+        const defaultProvider =
+          (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
+        const providerConfig = api.config.models?.providers?.[defaultProvider];
+        if (providerConfig) {
+          const pc = providerConfig as Record<string, unknown>;
+          const providerApi = (pc.api as string) ?? undefined;
+          const stashTarget = {
+            baseUrl: (pc.baseUrl as string) ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
+            apiKey: (pc.apiKey as string) ?? "",
+            provider: defaultProvider,
+            api: providerApi,
+          };
+          stashOriginalProvider(sessionKey, stashTarget);
         }
+        const modelInfo = decision.target.model ? ` (model=${decision.target.model})` : "";
         api.logger.info(
-          `[ClawXrouter] S2 — routing through privacy proxy${targetModel ? ` (model=${targetModel})` : ""} [${decision.routerId}]`,
+          `[GuardClaw] S2 — routing through privacy proxy${modelInfo} [${decision.routerId}]`,
         );
         return {
           providerOverride: "clawxrouter-privacy",
-          ...(targetModel ? { modelOverride: targetModel } : {}),
+          ...(decision.target.model ? { modelOverride: decision.target.model } : {}),
         };
+      }
+
+      // S2-wrap path: desensitize with fake data, send to cloud via privacy proxy
+      if (decision.level === "S2" && decision.target?.provider === "clawxrouter-wrap") {
+        markSessionAsPrivate(sessionKey, "S2");
+        const wrapResult = await wrapDesensitize(msgStr, privacyConfig, sessionKey);
+        if (wrapResult.failed) {
+          const scoreInfo = wrapResult.sensitivityScore
+            ? ` (sensitivity=${wrapResult.sensitivityScore.score}, findings=${JSON.stringify(wrapResult.sensitivityScore.findings)})`
+            : "";
+          api.logger.warn(
+            `[GuardClaw] S2-wrap desensitization failed${scoreInfo} — escalating to S3`,
+          );
+          trackSessionLevel(sessionKey, "S3");
+          setActiveLocalRouting(sessionKey);
+          stashDetection(sessionKey, {
+            level: "S3",
+            reason: `${decision.reason}; wrap desensitization failed — escalated to S3`,
+            originalPrompt: msgStr,
+            timestamp: Date.now(),
+          });
+          const guardCfg = getGuardAgentConfig(privacyConfig);
+          const fallbackProvider = privacyConfig.localModel?.provider ?? "ollama";
+          return {
+            providerOverride: guardCfg?.provider ?? fallbackProvider,
+            modelOverride:
+              guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1",
+          };
+        }
+        stashWrappedPrompt(sessionKey, wrapResult.wrapped, msgStr);
+        stashDetection(sessionKey, {
+          level: "S2",
+          reason: decision.reason,
+          desensitized: wrapResult.wrapped,
+          originalPrompt: msgStr,
+          timestamp: Date.now(),
+        });
+        const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
+        const primaryModel =
+          ((defaults?.model as Record<string, unknown> | undefined)?.primary as string) ?? "";
+        const defaultProvider =
+          (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
+        const providerConfig = api.config.models?.providers?.[defaultProvider];
+        if (providerConfig) {
+          const pc = providerConfig as Record<string, unknown>;
+          const providerApi = (pc.api as string) ?? undefined;
+          stashOriginalProvider(sessionKey, {
+            baseUrl: (pc.baseUrl as string) ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
+            apiKey: (pc.apiKey as string) ?? "",
+            provider: defaultProvider,
+            api: providerApi,
+          });
+        }
+        const scoreStr = wrapResult.sensitivityScore
+          ? `, sensitivity=${wrapResult.sensitivityScore.score}`
+          : "";
+        api.logger.info(
+          `[GuardClaw] S2-wrap — ${wrapResult.mappingCount} PII items replaced${scoreStr}, routing through privacy proxy`,
+        );
+        return { providerOverride: "clawxrouter-privacy" };
       }
 
       // Non-privacy routers may return redirect with a custom target
       if (decision.action === "redirect" && decision.target) {
         api.logger.info(
-          `[ClawXrouter] ${decision.level} — custom route to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
+          `[GuardClaw] ${decision.level} — custom route to ${decision.target.provider}/${decision.target.model} [${decision.routerId}]`,
         );
         return {
           providerOverride: decision.target.provider,
@@ -435,7 +425,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const guardCfg = getGuardAgentConfig(privacyConfig);
         const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
         api.logger.warn(
-          `[ClawXrouter] ${decision.level} BLOCK — redirecting to edge model [${decision.routerId}]`,
+          `[GuardClaw] ${decision.level} BLOCK — redirecting to edge model [${decision.routerId}]`,
         );
         return {
           providerOverride: guardCfg?.provider ?? defaultProvider,
@@ -460,7 +450,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const guardCfg = getGuardAgentConfig(privacyConfig);
           const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
           api.logger.info(
-            `[ClawXrouter] S3 TRANSFORM — routing to edge model [${decision.routerId}]`,
+            `[GuardClaw] S3 TRANSFORM — routing to edge model [${decision.routerId}]`,
           );
           return {
             providerOverride: guardCfg?.provider ?? defaultProvider,
@@ -485,7 +475,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             const guardCfg = getGuardAgentConfig(privacyConfig);
             const defaultProvider = privacyConfig.localModel?.provider ?? "ollama";
             api.logger.info(
-              `[ClawXrouter] S2 TRANSFORM — routing to local ${guardCfg?.provider ?? defaultProvider} [${decision.routerId}]`,
+              `[GuardClaw] S2 TRANSFORM — routing to local ${guardCfg?.provider ?? defaultProvider} [${decision.routerId}]`,
             );
             return {
               providerOverride: guardCfg?.provider ?? defaultProvider,
@@ -494,54 +484,50 @@ export function registerHooks(api: OpenClawPluginApi): void {
             };
           }
 
-          const transformModel = decision.target?.model;
-          const transformActualProvider =
-            decision.target?.originalProvider ??
-            (transformModel
-              ? resolveOriginalProvider(
-                  api.config as Record<string, unknown>,
-                  transformModel,
-                  defaultProvider,
-                )
-              : defaultProvider);
-          if (transformModel) {
-            ensureModelMirrored(
-              api.config as Record<string, unknown>,
-              transformModel,
-              transformActualProvider,
-              () => {
-                try {
-                  return api.runtime.config.loadConfig();
-                } catch {
-                  return undefined;
-                }
-              },
-            );
+          // S2-proxy: route through privacy proxy to strip any residual PII
+          const defaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
+          const primaryModel =
+            ((defaults?.model as Record<string, unknown> | undefined)?.primary as string) ?? "";
+          const defaultProvider =
+            (defaults?.provider as string) || primaryModel.split("/")[0] || "openai";
+          const providerConfig = api.config.models?.providers?.[defaultProvider];
+          if (providerConfig) {
+            const pc = providerConfig as Record<string, unknown>;
+            const providerApi = (pc.api as string) ?? undefined;
+            stashOriginalProvider(sessionKey, {
+              baseUrl:
+                (pc.baseUrl as string) ?? resolveDefaultBaseUrl(defaultProvider, providerApi),
+              apiKey: (pc.apiKey as string) ?? "",
+              provider: defaultProvider,
+              api: providerApi,
+            });
           }
-          const transformModelInfo = transformModel ? ` (model=${transformModel})` : "";
           api.logger.info(
-            `[ClawXrouter] S2 TRANSFORM — routing through privacy proxy${transformModelInfo} [${decision.routerId}]`,
+            `[GuardClaw] S2 TRANSFORM — routing through privacy proxy [${decision.routerId}]`,
           );
-          return {
-            providerOverride: "clawxrouter-privacy",
-            ...(transformModel ? { modelOverride: transformModel } : {}),
-          };
+          return { providerOverride: "clawxrouter-privacy" };
         }
 
-        // S1 + transform: route through proxy for defense-in-depth
-        return { providerOverride: "clawxrouter-privacy" };
+        // S1 + transform: no sensitive data, let original provider handle it
+        return;
       }
 
-      // Default: route through proxy for defense-in-depth
-      return { providerOverride: "clawxrouter-privacy" };
+      // Default: no override — let the original provider handle the request
+      // so provider-specific sanitization (Google turn ordering, tool schema
+      // cleaning, transcript policy) in openclaw core still triggers correctly.
+      return;
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_model_resolve hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_model_resolve hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 2: before_prompt_build — Inject guard prompt / S2 markers /
+  //         dual-track history for local models
+  // =========================================================================
   api.on("before_prompt_build", async (_event, ctx) => {
     try {
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey) return;
 
       const pending = getPendingDetection(sessionKey);
@@ -560,7 +546,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         if (shouldInject) {
           const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
           if (context) {
-            api.logger.info(`[ClawXrouter] Injected dual-track history context for S3 turn`);
+            api.logger.info(`[GuardClaw] Injected dual-track history context for S3 turn`);
             return { prependContext: context };
           }
         }
@@ -574,7 +560,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         if (shouldInject) {
           const context = await loadDualTrackContext(sessionKey, ctx.agentId, historyLimit);
           if (context) {
-            api.logger.info(`[ClawXrouter] Injected dual-track history context for S2-local turn`);
+            api.logger.info(`[GuardClaw] Injected dual-track history context for S2-local turn`);
             return { prependContext: context };
           }
         }
@@ -593,27 +579,26 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // the proxy's fallback regex redaction provides defense-in-depth.
       if (pending.level === "S2" && pending.desensitized) {
         return {
-          prependContext: `${CLAWXROUTER_S2_OPEN}\n${pending.desensitized}\n${CLAWXROUTER_S2_CLOSE}`,
+          prependContext: `${GUARDCLAW_S2_OPEN}\n${pending.desensitized}\n${GUARDCLAW_S2_CLOSE}`,
         };
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_prompt_build hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_prompt_build hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 3: before_tool_call — Run pipeline at onToolCallProposed
+  // =========================================================================
   api.on("before_tool_call", async (event, ctx) => {
     try {
       const { toolName, params } = event;
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       if (!toolName) return;
 
       const typedParams = params as Record<string, unknown>;
       const privacyConfig = getLiveConfig();
-      if (!privacyConfig.enabled || !privacyConfig.routers?.privacy?.enabled) {
-        recordDetection(sessionKey, "S1", "onToolCallProposed", `tool: ${toolName}`);
-        return;
-      }
-      const baseDir = privacyConfig.session?.baseDir ?? resolveStateDir(process.env);
+      const baseDir = privacyConfig.session?.baseDir ?? "~/.openclaw";
 
       // File-access guard for cloud models only — local models (Guard Agent
       // sessions and S3 active routing) are trusted to read full history.
@@ -622,11 +607,11 @@ export function registerHooks(api: OpenClawPluginApi): void {
         for (const p of pathValues) {
           if (isProtectedMemoryPath(p, baseDir)) {
             api.logger.warn(
-              `[ClawXrouter] BLOCKED: cloud model tried to access protected path: ${p}`,
+              `[GuardClaw] BLOCKED: cloud model tried to access protected path: ${p}`,
             );
             return {
               block: true,
-              blockReason: `ClawXrouter: access to full history/memory is restricted for cloud models (${p})`,
+              blockReason: `GuardClaw: access to full history/memory is restricted for cloud models (${p})`,
             };
           }
         }
@@ -668,7 +653,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             trackSessionLevel(sessionKey, "S3");
             return {
               block: true,
-              blockReason: `ClawXrouter: ${isSpawn ? "subagent task" : "A2A message"} blocked — S3 (${ruleResult.reason ?? "sensitive"})`,
+              blockReason: `GuardClaw: ${isSpawn ? "subagent task" : "A2A message"} blocked — S3 (${ruleResult.reason ?? "sensitive"})`,
             };
           }
           if (ruleResult.level === "S2") {
@@ -717,7 +702,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           trackSessionLevel(sessionKey, "S3");
           return {
             block: true,
-            blockReason: `ClawXrouter: tool "${toolName}" blocked — S3 (${reason ?? "sensitive"})`,
+            blockReason: `GuardClaw: tool "${toolName}" blocked — S3 (${reason ?? "sensitive"})`,
           };
         }
         if (level === "S2") {
@@ -725,13 +710,19 @@ export function registerHooks(api: OpenClawPluginApi): void {
         }
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_tool_call hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_tool_call hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 4: tool_result_persist — single handler for tool result privacy
+  //         + memory_search filtering + memory dual-write sync
+  // =========================================================================
   api.on("tool_result_persist", (event, ctx) => {
     try {
-      const sessionKey = resolveHookSessionKey(ctx) || `anon-${Date.now()}`;
+      const sessionKey = ctx.sessionKey ?? "";
+      if (!sessionKey) return;
+
       const msg = event.message;
       if (!msg) return;
 
@@ -752,7 +743,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
             api.logger,
             isGuardSessionKey(sessionKey),
           ).catch((err) => {
-            api.logger.warn(`[ClawXrouter] Memory dual-write sync failed: ${String(err)}`);
+            api.logger.warn(`[GuardClaw] Memory dual-write sync failed: ${String(err)}`);
           });
         }
       }
@@ -785,7 +776,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
           if (redacted !== textContent) {
             api.logger.info(
-              `[ClawXrouter] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`,
+              `[GuardClaw] S3 tool result PII-redacted for transcript (tool=${ctx.toolName ?? "unknown"})`,
             );
             sessionManager
               .writeToClean(sessionKey, {
@@ -822,15 +813,6 @@ export function registerHooks(api: OpenClawPluginApi): void {
       // This sync hook is the single handler for tool result privacy:
       // it is the only hook that can modify the persisted transcript.
       const privacyConfig = getLiveConfig();
-      if (!privacyConfig.enabled || !privacyConfig.routers?.privacy?.enabled) {
-        recordDetection(
-          sessionKey,
-          "S1",
-          "onToolCallExecuted",
-          `result: ${ctx.toolName ?? "unknown"}`,
-        );
-        return;
-      }
 
       // Snapshot the turn-level privacy state BEFORE detection runs.
       // markSessionAsPrivate() updates currentTurnLevel immediately, so
@@ -865,60 +847,14 @@ export function registerHooks(api: OpenClawPluginApi): void {
         recordDetection(sessionKey, ruleCheck.level, "onToolCallExecuted", ruleCheck.reason);
         if (ruleCheck.level === "S3") {
           api.logger.warn(
-            `[ClawXrouter] S3 detected in tool result AFTER cloud model already active — ` +
+            `[GuardClaw] S3 detected in tool result AFTER cloud model already active — ` +
               `degrading to S2 (PII redaction). tool=${ctx.toolName ?? "unknown"}, reason=${ruleCheck.reason ?? "rule-match"}`,
           );
         }
       }
 
-      let redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
-      let wasRedacted = redacted !== textContent;
-
-      // S2 detected by rules but regex missed PII → fall back to LLM
-      // semantic desensitization (sync Worker, same as syncDetect pattern).
-      if (
-        detectedSensitive &&
-        !wasRedacted &&
-        effectiveLevel === "S2" &&
-        privacyConfig.localModel?.enabled
-      ) {
-        const desenResult = syncDesensitizeWithLocalModel(textContent, privacyConfig, sessionKey);
-        if (
-          desenResult.wasModelUsed &&
-          !desenResult.failed &&
-          desenResult.desensitized !== textContent
-        ) {
-          redacted = desenResult.desensitized;
-          wasRedacted = true;
-          api.logger.info(
-            `[ClawXrouter] S2 tool result LLM-desensitized (regex missed, tool=${ctx.toolName ?? "unknown"})`,
-          );
-        }
-      }
-
-      // Session already S2-private but rules didn't flag this specific result:
-      // the conversation is known to involve sensitive data, so tool results
-      // (e.g. reading the same file that triggered S2) very likely contain PII.
-      // Proactively desensitize to prevent leaking through the proxy / clean track.
-      if (
-        !detectedSensitive &&
-        !wasRedacted &&
-        wasPrivateBefore &&
-        privacyConfig.localModel?.enabled
-      ) {
-        const desenResult = syncDesensitizeWithLocalModel(textContent, privacyConfig, sessionKey);
-        if (
-          desenResult.wasModelUsed &&
-          !desenResult.failed &&
-          desenResult.desensitized !== textContent
-        ) {
-          redacted = desenResult.desensitized;
-          wasRedacted = true;
-          api.logger.info(
-            `[ClawXrouter] Proactive tool result desensitized for S2-private session (tool=${ctx.toolName ?? "unknown"})`,
-          );
-        }
-      }
+      const redacted = redactSensitiveInfo(textContent, getLiveConfig().redaction);
+      const wasRedacted = redacted !== textContent;
 
       if (detectedSensitive || wasRedacted || wasPrivateBefore) {
         const sessionManager = getDefaultSessionManager();
@@ -942,12 +878,18 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
       if (wasRedacted) {
         if (!detectedSensitive) markSessionAsPrivate(sessionKey, "S2");
-        stashDesensitizedToolResult(textContent, redacted);
+        api.logger.info(
+          `[GuardClaw] PII-redacted tool result for transcript (tool=${ctx.toolName ?? "unknown"})`,
+        );
         const modified = replaceMessageText(msg, redacted);
         if (modified) return { message: modified };
       }
 
       // ── Sync LLM detection via worker thread ──
+      // Rules cover keywords/regex but miss semantic sensitivity.
+      // synckit blocks the main thread (via Atomics.wait) for the LLM
+      // inference on a Worker, letting us use the result before returning.
+      // Timeout (20s) gracefully falls back to rules-only result.
       if (privacyConfig.localModel?.enabled && ruleCheck.level !== "S3") {
         const llmResult = syncDetectByLocalModel(
           {
@@ -971,57 +913,33 @@ export function registerHooks(api: OpenClawPluginApi): void {
           recordDetection(sessionKey, llmResult.level, "onToolCallExecuted", llmResult.reason);
           if (llmResult.level === "S3") {
             api.logger.warn(
-              `[ClawXrouter] LLM elevated tool result to S3 — PII redacted before reaching cloud model. ` +
+              `[GuardClaw] LLM elevated tool result to S3 — PII redacted before reaching cloud model. ` +
                 `tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"}`,
             );
           } else {
             api.logger.info(
-              `[ClawXrouter] LLM elevated tool result to ${llmResult.level} (tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"})`,
+              `[GuardClaw] LLM elevated tool result to ${llmResult.level} (tool=${ctx.toolName ?? "unknown"}, reason=${llmResult.reason ?? "semantic"})`,
             );
           }
 
-          // LLM-elevated S2: desensitize before dual-write / transcript so
-          // the clean track and persisted message contain redacted content.
-          let llmDesensitized: string | undefined;
-          if (llmResult.level === "S2" && !wasRedacted && privacyConfig.localModel?.enabled) {
-            const desenResult = syncDesensitizeWithLocalModel(
-              textContent,
-              privacyConfig,
-              sessionKey,
-            );
-            if (
-              desenResult.wasModelUsed &&
-              !desenResult.failed &&
-              desenResult.desensitized !== textContent
-            ) {
-              llmDesensitized = desenResult.desensitized;
-              api.logger.info(
-                `[ClawXrouter] LLM-elevated S2 tool result desensitized (tool=${ctx.toolName ?? "unknown"})`,
-              );
-            }
-          }
-
-          // Dual-write: ensure both full and clean tracks reflect the LLM's
-          // finding. When the earlier dual-write block already fired (because
-          // wasPrivateBefore was true), it wrote *unredacted* content to the
-          // clean track — overwrite it now with the desensitized version.
-          if (!detectedSensitive && !wasRedacted) {
+          // Use the snapshot taken before detection: if the turn wasn't
+          // already private AND rules/regex didn't write above, the LLM
+          // is the first to detect — dual-write here.
+          if (!detectedSensitive && !wasRedacted && !wasPrivateBefore) {
             const sessionManager = getDefaultSessionManager();
             const ts = Date.now();
-            if (!wasPrivateBefore) {
-              sessionManager
-                .writeToFull(sessionKey, {
-                  role: "tool",
-                  content: textContent,
-                  timestamp: ts,
-                  sessionKey,
-                })
-                .catch(() => {});
-            }
+            sessionManager
+              .writeToFull(sessionKey, {
+                role: "tool",
+                content: textContent,
+                timestamp: ts,
+                sessionKey,
+              })
+              .catch(() => {});
             sessionManager
               .writeToClean(sessionKey, {
                 role: "tool",
-                content: llmDesensitized ?? redacted,
+                content: redacted,
                 timestamp: ts,
                 sessionKey,
               })
@@ -1034,28 +952,22 @@ export function registerHooks(api: OpenClawPluginApi): void {
             const s3Redacted = wasRedacted
               ? redacted
               : redactSensitiveInfo(textContent, getLiveConfig().redaction);
-            stashDesensitizedToolResult(textContent, s3Redacted);
             const modified = replaceMessageText(msg, s3Redacted);
-            if (modified) return { message: modified };
-          }
-
-          const s2Content =
-            llmDesensitized ?? redactSensitiveInfo(textContent, getLiveConfig().redaction);
-          if (s2Content !== textContent) {
-            stashDesensitizedToolResult(textContent, s2Content);
-            const modified = replaceMessageText(msg, s2Content);
             if (modified) return { message: modified };
           }
         }
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in tool_result_persist hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in tool_result_persist hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 6: before_message_write — Dual history persistence + sanitize transcript
+  // =========================================================================
   api.on("before_message_write", (event, ctx) => {
     try {
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey) return;
 
       const msg = event.message;
@@ -1093,7 +1005,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
               sessionKey,
             })
             .catch((err) => {
-              console.error("[ClawXrouter] Failed to persist user message to full history:", err);
+              console.error("[GuardClaw] Failed to persist user message to full history:", err);
             });
           const cleanContent =
             pending.level === "S3"
@@ -1107,7 +1019,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
               sessionKey,
             })
             .catch((err) => {
-              console.error("[ClawXrouter] Failed to persist user message to clean history:", err);
+              console.error("[GuardClaw] Failed to persist user message to clean history:", err);
             });
         } else if (msgText) {
           if (role === "assistant" && isActiveLocalRouting(sessionKey)) {
@@ -1123,7 +1035,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
               })
               .catch((err) => {
                 console.error(
-                  "[ClawXrouter] Failed to persist assistant message to full history:",
+                  "[GuardClaw] Failed to persist assistant message to full history:",
                   err,
                 );
               });
@@ -1136,7 +1048,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
               })
               .catch((err) => {
                 console.error(
-                  "[ClawXrouter] Failed to persist assistant message to clean history:",
+                  "[GuardClaw] Failed to persist assistant message to clean history:",
                   err,
                 );
               });
@@ -1151,8 +1063,25 @@ export function registerHooks(api: OpenClawPluginApi): void {
                 sessionKey,
               })
               .catch((err) => {
-                console.error("[ClawXrouter] Failed to persist message to dual history:", err);
+                console.error("[GuardClaw] Failed to persist message to dual history:", err);
               });
+          }
+        }
+      }
+
+      // ── Wrap-mode restore: reverse-map fake data in assistant response ──
+      if (role === "assistant" && isWrapMode(sessionKey)) {
+        const wrapStash = consumeWrappedStash(sessionKey);
+        if (wrapStash) {
+          const assistantText = extractMessageText(msg);
+          if (assistantText) {
+            const manager = getGlobalWrapMappingManager();
+            const restored = manager.reverseReplace(assistantText, sessionKey);
+            if (restored !== assistantText) {
+              api.logger.info("[GuardClaw] S2-wrap restored assistant response via mapping");
+              const modified = replaceMessageText(msg, restored);
+              if (modified) return { message: modified };
+            }
           }
         }
       }
@@ -1167,7 +1096,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const redacted = redactSensitiveInfo(assistantText, getLiveConfig().redaction);
           if (redacted !== assistantText) {
             api.logger.info(
-              "[ClawXrouter] PII-redacted local model response before transcript write",
+              "[GuardClaw] PII-redacted local model response before transcript write",
             );
             return {
               message: {
@@ -1194,18 +1123,21 @@ export function registerHooks(api: OpenClawPluginApi): void {
         return { message: { ...msg, content: [{ type: "text", text: pending.desensitized }] } };
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_message_write hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_message_write hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 7: session_end — Memory sync
+  // =========================================================================
   api.on("session_end", async (event, ctx) => {
     try {
-      const sessionKey = event.sessionKey ?? resolveHookSessionKey(ctx);
+      const sessionKey = event.sessionKey ?? ctx.sessionKey;
       if (!sessionKey) return;
 
       const wasPrivate = isSessionMarkedPrivate(sessionKey);
       api.logger.info(
-        `[ClawXrouter] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory…`,
+        `[GuardClaw] ${wasPrivate ? "private" : "cloud"} session ${sessionKey} ended. Syncing memory…`,
       );
 
       const memMgr = getDefaultMemoryManager();
@@ -1217,95 +1149,92 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const collector = getGlobalCollector();
       if (collector) await collector.flush();
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in session_end hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in session_end hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 8: after_compaction — Full memory sync
+  // =========================================================================
   api.on("after_compaction", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
-      api.logger.info("[ClawXrouter] Memory synced after compaction");
+      api.logger.info("[GuardClaw] Memory synced after compaction");
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in after_compaction hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in after_compaction hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 9: llm_output — Token usage tracking
+  // =========================================================================
   api.on("llm_output", async (event, ctx) => {
     try {
-      const sessionKey = resolveHookSessionKey(ctx) || event.sessionId || "";
-      api.logger.info(
-        `[ClawXrouter] llm_output fired: session=${sessionKey} model=${event.model} usage=${JSON.stringify(event.usage)}`,
-      );
+      const sessionKey = ctx.sessionKey ?? event.sessionId ?? "";
+      const provider = event.provider ?? "unknown";
+      const model = event.model ?? "unknown";
+
       const collector = getGlobalCollector();
-      if (!collector) return;
-      collector.record({
+      collector?.record({
         sessionKey,
-        provider: event.provider ?? "unknown",
-        model: event.model ?? "unknown",
+        provider,
+        model,
         source: "task",
         usage: event.usage,
-        loopId: getCurrentLoopId(sessionKey),
       });
-      if (sessionKey) {
-        const u = event.usage ?? {};
-        const inputTok = u.inputTokens ?? u.prompt_tokens ?? 0;
-        const outputTok = u.outputTokens ?? u.completion_tokens ?? 0;
-        const cacheTok = u.cacheReadTokens ?? u.cache_read_input_tokens ?? 0;
-        const summary =
-          `${event.model ?? "unknown"} — in:${inputTok} out:${outputTok}` +
-          (cacheTok ? ` cache:${cacheTok}` : "");
-        recordDetection(sessionKey, "S1", "onLlmOutput" as any, summary);
-        notifyLlmComplete(sessionKey, "onUserMessage");
-      }
+
+      const liveConfig = getLiveConfig();
+      const origin =
+        provider === "clawxrouter-privacy"
+          ? "cloud"
+          : isLocalProvider(provider, liveConfig.localProviders)
+            ? "local"
+            : "cloud";
+      const reason =
+        provider === "clawxrouter-privacy"
+          ? "clawxrouter_proxy_to_cloud"
+          : origin === "local"
+            ? "local_provider"
+            : "provider_not_local";
+
+      recordFinalReply({
+        sessionKey,
+        provider,
+        model,
+        usage: event.usage,
+        extraLocalProviders: liveConfig.localProviders,
+        originHint: origin,
+        reasonHint: reason,
+      });
+
+      // Freeze the current loop snapshot once a final reply is emitted.
+      finalizeLoop(sessionKey);
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in llm_output hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in llm_output hook: ${String(err)}`);
     }
   });
 
-  api.on("llm_input", async (event, ctx) => {
-    try {
-      const sessionKey = resolveHookSessionKey(ctx) || event.sessionId || "";
-      const routeLevel = getSessionRouteLevel(sessionKey);
-
-      if (routeLevel === "S3") return;
-
-      const estimateTokens = (s: string | undefined) => Math.ceil((s?.length ?? 0) / 4);
-      let inputTokens = estimateTokens(event.systemPrompt) + estimateTokens(event.prompt);
-      if (Array.isArray(event.historyMessages)) {
-        for (const m of event.historyMessages) {
-          inputTokens += estimateTokens(typeof m === "string" ? m : JSON.stringify(m));
-        }
-      }
-
-      const pricing = lookupPricing(event.model);
-      const estimatedCost = (inputTokens * pricing.inputPer1M) / 1_000_000;
-
-      notifyInputEstimate(sessionKey, {
-        estimatedInputTokens: inputTokens,
-        estimatedCost,
-        model: event.model,
-        provider: event.provider,
-      });
-    } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in llm_input hook: ${String(err)}`);
-    }
-  });
-
+  // =========================================================================
+  // Hook 10: before_reset — Full memory sync before session clear
+  // =========================================================================
   api.on("before_reset", async (_event, ctx) => {
     try {
       if (ctx.workspaceDir) _cachedWorkspaceDir = ctx.workspaceDir;
       const memMgr = getDefaultMemoryManager();
       const privacyConfig = getLiveConfig();
       await memMgr.syncAllMemoryToClean(privacyConfig);
-      api.logger.info("[ClawXrouter] Memory synced before reset");
+      api.logger.info("[GuardClaw] Memory synced before reset");
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_reset hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_reset hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 11: message_sending — Outbound message guard (via pipeline)
+  // =========================================================================
   api.on("message_sending", async (event, ctx) => {
     try {
       const { content } = event;
@@ -1317,7 +1246,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
       const pipeline = getGlobalPipeline();
       if (!pipeline) return;
 
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       const decision = await pipeline.run(
         "onUserMessage",
         { checkpoint: "onUserMessage", message: content, sessionKey },
@@ -1325,32 +1254,31 @@ export function registerHooks(api: OpenClawPluginApi): void {
       );
 
       if (decision.level === "S3" || decision.action === "block") {
-        api.logger.warn("[ClawXrouter] BLOCKED outbound message: S3/block detected");
+        api.logger.warn("[GuardClaw] BLOCKED outbound message: S3/block detected");
         return { cancel: true };
       }
       if (decision.level === "S2") {
-        const desenResult = await desensitizeWithLocalModel(
-          content,
-          privacyConfig,
-          resolveHookSessionKey(ctx) || undefined,
-        );
+        const desenResult = await desensitizeWithLocalModel(content, privacyConfig, ctx.sessionKey);
         if (desenResult.failed) {
           api.logger.warn(
-            "[ClawXrouter] S2 desensitization failed — cancelling outbound message to prevent PII leak",
+            "[GuardClaw] S2 desensitization failed — cancelling outbound message to prevent PII leak",
           );
           return { cancel: true };
         }
         return { content: desenResult.desensitized };
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in message_sending hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in message_sending hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 12: before_agent_start — Subagent guard (via pipeline)
+  // =========================================================================
   api.on("before_agent_start", async (event, ctx) => {
     try {
       const { prompt } = event;
-      const sessionKey = resolveHookSessionKey(ctx);
+      const sessionKey = ctx.sessionKey ?? "";
       if (!sessionKey.includes(":subagent:") || !prompt?.trim()) return;
 
       const privacyConfig = getLiveConfig();
@@ -1375,9 +1303,7 @@ export function registerHooks(api: OpenClawPluginApi): void {
         const provider = guardCfg?.provider ?? defaultProvider;
         const model =
           guardCfg?.modelName ?? privacyConfig.localModel?.model ?? "openbmb/minicpm4.1";
-        api.logger.info(
-          `[ClawXrouter] Subagent ${decision.level} — routing to ${provider}/${model}`,
-        );
+        api.logger.info(`[GuardClaw] Subagent ${decision.level} — routing to ${provider}/${model}`);
         return {
           providerOverride: provider,
           modelOverride: model,
@@ -1392,77 +1318,32 @@ export function registerHooks(api: OpenClawPluginApi): void {
           const provider = guardCfg?.provider ?? fallbackProvider;
           const model = guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "openbmb/minicpm4.1";
           api.logger.warn(
-            `[ClawXrouter] Subagent S2 desensitization failed — routing to local ${provider}/${model}`,
+            `[GuardClaw] Subagent S2 desensitization failed — routing to local ${provider}/${model}`,
           );
           return { providerOverride: provider, modelOverride: model };
         }
-
-        markSessionAsPrivate(sessionKey, "S2");
-        const s2Policy = privacyCfg.s2Policy ?? "proxy";
-
-        if (s2Policy === "local") {
-          const guardCfg = getGuardAgentConfig(privacyCfg);
-          const defaultProvider = privacyCfg.localModel?.provider ?? "ollama";
-          api.logger.info(
-            `[ClawXrouter] Subagent S2 — routing to local ${guardCfg?.provider ?? defaultProvider}`,
-          );
-          return {
-            providerOverride: guardCfg?.provider ?? defaultProvider,
-            modelOverride:
-              guardCfg?.modelName ?? privacyCfg.localModel?.model ?? "openbmb/minicpm4.1",
-          };
-        }
-
-        const subTargetModel = decision.target?.model;
-        if (subTargetModel) {
-          const subDefaults = api.config.agents?.defaults as Record<string, unknown> | undefined;
-          const subPrimaryModel =
-            ((subDefaults?.model as Record<string, unknown> | undefined)?.primary as string) ?? "";
-          const subDefaultProvider =
-            (subDefaults?.provider as string) || subPrimaryModel.split("/")[0] || "openai";
-          const subActualProvider =
-            decision.target?.originalProvider ??
-            resolveOriginalProvider(
-              api.config as Record<string, unknown>,
-              subTargetModel,
-              subDefaultProvider,
-            );
-          ensureModelMirrored(
-            api.config as Record<string, unknown>,
-            subTargetModel,
-            subActualProvider,
-            () => {
-              try {
-                return api.runtime.config.loadConfig();
-              } catch {
-                return undefined;
-              }
-            },
-          );
-        }
-
-        api.logger.info("[ClawXrouter] Subagent S2 — routing through privacy proxy");
-        return {
-          prependContext: `${CLAWXROUTER_S2_OPEN}\n${desenResult.desensitized}\n${CLAWXROUTER_S2_CLOSE}`,
-          providerOverride: "clawxrouter-privacy",
-        };
+        api.logger.info("[GuardClaw] Subagent S2 — prompt desensitized before forwarding");
+        return { prompt: desenResult.desensitized };
       }
     } catch (err) {
-      api.logger.error(`[ClawXrouter] Error in before_agent_start hook: ${String(err)}`);
+      api.logger.error(`[GuardClaw] Error in before_agent_start hook: ${String(err)}`);
     }
   });
 
+  // =========================================================================
+  // Hook 13: message_received — Observational logging
+  // =========================================================================
   api.on("message_received", async (event, _ctx) => {
     try {
       const privacyConfig = getLiveConfig();
       if (!privacyConfig.enabled) return;
-      api.logger.info?.(`[ClawXrouter] Message received from ${event.from ?? "unknown"}`);
+      api.logger.info?.(`[GuardClaw] Message received from ${event.from ?? "unknown"}`);
     } catch {
       /* observational only */
     }
   });
 
-  api.logger.info("[ClawXrouter] All hooks registered (13 hooks, pipeline-driven)");
+  api.logger.info("[GuardClaw] All hooks registered (13 hooks, pipeline-driven)");
 }
 
 // ==========================================================================
@@ -1471,22 +1352,8 @@ export function registerHooks(api: OpenClawPluginApi): void {
 
 function shouldSkipMessage(msg: string): boolean {
   if (msg.includes("[REDACTED:") || msg.startsWith("[SYSTEM]")) return true;
-  // OpenClaw prepends timestamps like "[Thu 2026-03-19 20:19 GMT+8] ..." to user
-  // messages. Only skip if the ENTIRE message is a bare timestamp (no real content).
-  const stripped = msg.replace(
-    /^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}[^\]]*\]\s*/,
-    "",
-  );
-  if (stripped.length === 0) return true;
+  if (/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(msg)) return true;
   return false;
-}
-
-/** Strip OpenClaw's timestamp prefix from a user message, if present. */
-function stripTimestampPrefix(msg: string): string {
-  return msg.replace(
-    /^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}[^\]]*\]\s*/,
-    "",
-  );
 }
 
 /**
@@ -1638,9 +1505,9 @@ async function syncMemoryWrite(
   const redacted = await memMgr.redactContentPublic(content, privacyConfig);
   if (redacted !== content) {
     await fs.promises.writeFile(absPath, redacted, "utf-8");
-    logger.info(`[ClawXrouter] Memory dual-write: ${rel} → ${fullRelPath} (redacted clean copy)`);
+    logger.info(`[GuardClaw] Memory dual-write: ${rel} → ${fullRelPath} (redacted clean copy)`);
   } else {
-    logger.info(`[ClawXrouter] Memory dual-write: ${rel} → ${fullRelPath} (no PII found)`);
+    logger.info(`[GuardClaw] Memory dual-write: ${rel} → ${fullRelPath} (no PII found)`);
   }
 }
 

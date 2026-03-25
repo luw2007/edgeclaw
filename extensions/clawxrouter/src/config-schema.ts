@@ -1,12 +1,18 @@
-import { join } from "node:path";
-import { Type } from "@sinclair/typebox";
-import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+/**
+ * GuardClaw Config Schema
+ *
+ * Configuration schema for the GuardClaw plugin using TypeBox.
+ */
 
-export const clawXrouterConfigSchema = Type.Object({
+import { Type } from "@sinclair/typebox";
+
+export const guardClawConfigSchema = Type.Object({
   privacy: Type.Optional(
     Type.Object({
       enabled: Type.Optional(Type.Boolean()),
-      s2Policy: Type.Optional(Type.Union([Type.Literal("proxy"), Type.Literal("local")])),
+      s2Policy: Type.Optional(
+        Type.Union([Type.Literal("proxy"), Type.Literal("local"), Type.Literal("wrap")]),
+      ),
       proxyPort: Type.Optional(Type.Number()),
       checkpoints: Type.Optional(
         Type.Object({
@@ -139,13 +145,52 @@ export const clawXrouterConfigSchema = Type.Object({
           pin: Type.Optional(Type.Boolean()),
         }),
       ),
+      wrapConfig: Type.Optional(
+        Type.Object({
+          wrapModel: Type.Optional(
+            Type.Object({
+              type: Type.Optional(
+                Type.Union([
+                  Type.Literal("openai-compatible"),
+                  Type.Literal("ollama-native"),
+                  Type.Literal("custom"),
+                ]),
+              ),
+              provider: Type.Optional(Type.String()),
+              model: Type.Optional(Type.String()),
+              endpoint: Type.Optional(Type.String()),
+              apiKey: Type.Optional(Type.String()),
+              module: Type.Optional(Type.String()),
+            }),
+          ),
+          fakeDataLocale: Type.Optional(Type.String()),
+          restoreMode: Type.Optional(
+            Type.Union([Type.Literal("mapping-only"), Type.Literal("mapping-with-llm")]),
+          ),
+          mappingTtlMs: Type.Optional(Type.Number()),
+          sensitivityThreshold: Type.Optional(Type.Number()),
+          enableSensitivityCheck: Type.Optional(Type.Boolean()),
+          sensitivityBlockOnFail: Type.Optional(Type.Boolean()),
+        }),
+      ),
     }),
   ),
 });
 
+/**
+ * Default configuration values.
+ *
+ * onUserMessage: rules first (fast, deterministic) then LLM judge for semantic detection.
+ *   Both are needed: rules alone miss semantic sensitivity; LLM alone may miss
+ *   keyword-level matches and override rule-based S2 detections with S1.
+ * onToolCallProposed: rules-only by default (fast, no LLM overhead per tool call).
+ *   Users can add "localModelDetector" to enable LLM detection for tool calls.
+ * onToolCallExecuted: rules-only; sync LLM supplement is separately controlled
+ *   by localModel.enabled (not by this checkpoint config).
+ */
 export const defaultPrivacyConfig = {
   enabled: true,
-  s2Policy: "proxy" as "proxy" | "local",
+  s2Policy: "proxy" as "proxy" | "local" | "wrap",
   proxyPort: 8403,
   checkpoints: {
     onUserMessage: ["ruleDetector" as const, "localModelDetector" as const],
@@ -174,7 +219,7 @@ export const defaultPrivacyConfig = {
   },
   guardAgent: {
     id: "guard",
-    workspace: join(resolveStateDir(process.env), "workspace-guard"),
+    workspace: "~/.openclaw/workspace-guard",
     model: "ollama/openbmb/minicpm4.1",
   },
   localProviders: [] as string[],
@@ -199,9 +244,17 @@ export const defaultPrivacyConfig = {
     chineseAddress: false,
     pin: false,
   },
+  wrapConfig: {
+    fakeDataLocale: "zh-CN",
+    restoreMode: "mapping-with-llm" as "mapping-only" | "mapping-with-llm",
+    mappingTtlMs: 300_000,
+    sensitivityThreshold: 0.3,
+    enableSensitivityCheck: false,
+    sensitivityBlockOnFail: false,
+  },
   session: {
     isolateGuardHistory: true,
-    baseDir: resolveStateDir(process.env),
+    baseDir: "~/.openclaw",
     injectDualHistory: true,
     historyLimit: 20,
   },
